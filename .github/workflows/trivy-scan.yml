@@ -1,0 +1,107 @@
+# Trivy vulnerability scan on the two Docker variants.
+#
+# Triggered on PRs that touch the Dockerfile(s) or Go dependencies. Builds
+# both images locally, scans for HIGH and CRITICAL CVEs, and fails the PR if
+# any are found in packages that have a fix available. Unfixable CVEs (no
+# upstream patch yet) are reported in the summary but don't block the merge.
+#
+# Also runs weekly on a cron against the published images so we catch new
+# CVEs reported after release.
+#
+# The Dockerfiles COPY the binary from $TARGETPLATFORM/slurm_exporter (the
+# GoReleaser dockers_v2 layout), so this workflow compiles the binary into
+# ./linux/amd64/ and builds with platforms: linux/amd64, mirroring what
+# GoReleaser does for releases and `make docker-build` for local dev.
+
+name: Trivy scan
+
+on:
+  pull_request:
+    paths:
+      - 'Dockerfile'
+      - 'Dockerfile.minimal'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/trivy-scan.yml'
+  schedule:
+    - cron: '0 6 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  scan-standard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - name: Build Go binary in a Go container
+        # Compile inside golang:1.26.8-alpine to pin the stdlib version
+        # embedded in the binary. setup-go + host build can drift to a
+        # cached older patch version; the container guarantees what Trivy
+        # will see.
+        run: |
+          docker run --rm \
+            -v "$(pwd):/src" \
+            -w /src \
+            -e CGO_ENABLED=0 \
+            -e GOOS=linux \
+            -e GOTOOLCHAIN=local \
+            golang:1.26.8-alpine \
+            go build -ldflags "-s -w" -o ./linux/amd64/slurm_exporter ./cmd/slurm_exporter
+      - name: Build standard image
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: slurm_exporter:scan
+      - name: Trivy scan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: slurm_exporter:scan
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: '1'
+          format: table
+
+  scan-minimal:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+      - name: Build Go binary in a Go container
+        # Compile inside golang:1.26.8-alpine to pin the stdlib version
+        # embedded in the binary. setup-go + host build can drift to a
+        # cached older patch version; the container guarantees what Trivy
+        # will see.
+        run: |
+          docker run --rm \
+            -v "$(pwd):/src" \
+            -w /src \
+            -e CGO_ENABLED=0 \
+            -e GOOS=linux \
+            -e GOTOOLCHAIN=local \
+            golang:1.26.8-alpine \
+            go build -ldflags "-s -w" -o ./linux/amd64/slurm_exporter ./cmd/slurm_exporter
+      - name: Build minimal image
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          file: Dockerfile.minimal
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: slurm_exporter:scan-minimal
+      - name: Trivy scan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: slurm_exporter:scan-minimal
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: '1'
+          format: table

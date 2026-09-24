@@ -1,0 +1,260 @@
+package collector
+
+import (
+	"regexp"
+	"strconv"
+	"strings"
+
+	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/sckyzo/slurm_exporter/internal/logger"
+)
+
+/*
+PartitionsData executes the sinfo command to retrieve partition CPU information.
+Expected sinfo output format: "%R,%C" (PartitionName,Alloc/Idle/Other/Total CPUs).
+*/
+func PartitionsData(logger *logger.Logger, cluster string) ([]byte, error) {
+	args := []string{"-a", "-h", "-o", "%R,%C"}
+	if cluster != "" {
+		args = append([]string{"-M", cluster}, args...)
+	}
+	return Execute(logger, "sinfo", args)
+}
+
+/*
+PartitionsGpuData executes the sinfo command to retrieve partition GPU information.
+Expected sinfo output format: space-separated columns
+"Nodes Partition Gres GresUsed".
+
+Trailing ":" forces variable column widths; fixed widths (was Partition:30,
+Gres:50, GresUsed:50) silently truncate long partition names or rich GRES
+specs (e.g. multi-type GPU + MIG slices), producing wrong GPU counts.
+See https://github.com/SckyzO/slurm_exporter/issues/10.
+*/
+func PartitionsGpuData(logger *logger.Logger, cluster string) ([]byte, error) {
+	args := []string{"-a", "-h", "--Format=Nodes: ,Partition: ,Gres: ,GresUsed:", "--state=idle,allocated"}
+	if cluster != "" {
+		args = append([]string{"-M", cluster}, args...)
+	}
+	return Execute(logger, "sinfo", args)
+}
+
+/*
+PartitionsPendingJobsData executes the squeue command to retrieve pending job counts per partition.
+Expected squeue output format: "%P" (PartitionName).
+*/
+func PartitionsPendingJobsData(logger *logger.Logger, cluster string) ([]byte, error) {
+	args := []string{"-a", "-r", "-h", "-o", "%P", "--states=PENDING"}
+	if cluster != "" {
+		args = append([]string{"-M", cluster}, args...)
+	}
+	return Execute(logger, "squeue", args)
+}
+
+/*
+PartitionsRunningJobsData executes the squeue command to retrieve running job counts per partition.
+Expected squeue output format: "%P" (PartitionName).
+*/
+func PartitionsRunningJobsData(logger *logger.Logger, cluster string) ([]byte, error) {
+	args := []string{"-a", "-r", "-h", "-o", "%P", "--states=RUNNING"}
+	if cluster != "" {
+		args = append([]string{"-M", cluster}, args...)
+	}
+	return Execute(logger, "squeue", args)
+}
+
+type PartitionMetrics struct {
+	cpuAllocated float64
+	cpuIdle      float64
+	cpuOther     float64
+	cpuTotal     float64
+	jobPending   float64
+	jobRunning   float64
+	gpuIdle      float64
+	gpuAllocated float64
+}
+
+var (
+	partitionGpuRe = regexp.MustCompile(`gpu:(\(null\)|[^:(]*):?([0-9]+)(\([^)]*\))?`)
+)
+
+// parseGpuCount sums all gpu:*:N matches in a GRES string.
+//
+// A GRES string can list multiple GPU types on the same node, e.g.
+// "gpu:A100:4,gpu:H100:2" → 6. Previously this function only returned the
+// first match (4), causing slurm_partition_gpus_* to undercount on
+// multi-type GPU nodes. Aligned with gpus.go::parseGPUCount, which has
+// always iterated correctly.
+func parseGpuCount(gpuSpec string, re *regexp.Regexp) float64 {
+	var count = 0.0
+	for _, spec := range strings.Split(gpuSpec, ",") {
+		if !strings.Contains(spec, "gpu:") {
+			continue
+		}
+		matches := re.FindStringSubmatch(spec)
+		if len(matches) > 2 {
+			gpuCount, _ := strconv.ParseFloat(matches[2], 64)
+			count += gpuCount
+		}
+	}
+	return count
+}
+
+// parsePartitionCPUs parses sinfo "%R,%C" output into the partitions map.
+func parsePartitionCPUs(data []byte, partitions map[string]*PartitionMetrics) {
+	for _, line := range strings.Split(string(data), "\n") {
+		if !strings.Contains(line, ",") {
+			continue
+		}
+		splitLine := strings.Split(line, ",")
+		if len(splitLine) < 2 {
+			continue
+		}
+		// Strip the default-partition marker (*) so labels are consistent with
+		// nodes.go and other partition consumers — see issue #20.
+		partition := strings.TrimRight(splitLine[0], "*")
+		if _, exists := partitions[partition]; !exists {
+			partitions[partition] = &PartitionMetrics{}
+		}
+		statesSplit := strings.Split(splitLine[1], "/")
+		if len(statesSplit) < 4 {
+			continue
+		}
+		partitions[partition].cpuAllocated, _ = strconv.ParseFloat(statesSplit[0], 64)
+		partitions[partition].cpuIdle, _ = strconv.ParseFloat(statesSplit[1], 64)
+		partitions[partition].cpuOther, _ = strconv.ParseFloat(statesSplit[2], 64)
+		partitions[partition].cpuTotal, _ = strconv.ParseFloat(statesSplit[3], 64)
+	}
+}
+
+// parsePartitionGPUs parses sinfo "--Format=Nodes:,Partition:,Gres:,GresUsed:" output
+// into the partitions map. Initializes missing partitions (GPU-only nodes, issue #5).
+func parsePartitionGPUs(data []byte, partitions map[string]*PartitionMetrics) {
+	for _, line := range strings.Split(string(data), "\n") {
+		if len(line) == 0 || !strings.Contains(line, "gpu:") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 4 {
+			continue
+		}
+		numNodes, _ := strconv.ParseFloat(fields[0], 64)
+		// Strip the default-partition marker (*) so labels are consistent with
+		// nodes.go and other partition consumers — see issue #20.
+		partition := strings.TrimRight(fields[1], "*")
+		nodeGpus := parseGpuCount(fields[2], partitionGpuRe)
+		allocatedGpus := parseGpuCount(fields[3], partitionGpuRe)
+		if _, exists := partitions[partition]; !exists {
+			partitions[partition] = &PartitionMetrics{}
+		}
+		partitions[partition].gpuIdle += numNodes * (nodeGpus - allocatedGpus)
+		partitions[partition].gpuAllocated += numNodes * allocatedGpus
+	}
+}
+
+// parsePartitionJobs counts pending and running jobs per partition from squeue output.
+func parsePartitionJobs(pendingData, runningData []byte, partitions map[string]*PartitionMetrics) {
+	for _, partition := range strings.Split(string(pendingData), "\n") {
+		if _, exists := partitions[partition]; exists {
+			partitions[partition].jobPending++
+		}
+	}
+	for _, partition := range strings.Split(string(runningData), "\n") {
+		if _, exists := partitions[partition]; exists {
+			partitions[partition].jobRunning++
+		}
+	}
+}
+
+// ParsePartitionsMetrics collects CPU, GPU, and job metrics for all Slurm partitions.
+func ParsePartitionsMetrics(logger *logger.Logger, cluster string) (map[string]*PartitionMetrics, error) {
+	partitions := make(map[string]*PartitionMetrics)
+
+	cpuData, err := PartitionsData(logger, cluster)
+	if err != nil {
+		return nil, err
+	}
+	parsePartitionCPUs(cpuData, partitions)
+
+	gpuData, err := PartitionsGpuData(logger, cluster)
+	if err != nil {
+		return nil, err
+	}
+	parsePartitionGPUs(gpuData, partitions)
+
+	pendingData, err := PartitionsPendingJobsData(logger, cluster)
+	if err != nil {
+		return nil, err
+	}
+	runningData, err := PartitionsRunningJobsData(logger, cluster)
+	if err != nil {
+		return nil, err
+	}
+	parsePartitionJobs(pendingData, runningData, partitions)
+
+	return partitions, nil
+}
+
+type PartitionsCollector struct {
+	clusters     map[string]string
+	cpuAllocated *prometheus.Desc
+	cpuIdle      *prometheus.Desc
+	cpuOther     *prometheus.Desc
+	cpuTotal     *prometheus.Desc
+	jobPending   *prometheus.Desc
+	jobRunning   *prometheus.Desc
+	gpuIdle      *prometheus.Desc
+	gpuAllocated *prometheus.Desc
+	logger       *logger.Logger
+}
+
+func NewPartitionsCollector(logger *logger.Logger, clusters map[string]string) *PartitionsCollector {
+	labels := []string{"slurm_cluster", "partition"}
+	return &PartitionsCollector{
+		clusters:     clusters,
+		cpuAllocated: prometheus.NewDesc("slurm_exporter_partition_cpus_allocated", "Allocated CPUs for partition", labels, nil),
+		cpuIdle:      prometheus.NewDesc("slurm_exporter_partition_cpus_idle", "Idle CPUs for partition", labels, nil),
+		cpuOther:     prometheus.NewDesc("slurm_exporter_partition_cpus_other", "Other CPUs for partition", labels, nil),
+		cpuTotal:     prometheus.NewDesc("slurm_exporter_partition_cpus_total", "Total CPUs for partition", labels, nil),
+		jobPending:   prometheus.NewDesc("slurm_exporter_partition_jobs_pending", "Pending jobs for partition", labels, nil),
+		jobRunning:   prometheus.NewDesc("slurm_exporter_partition_jobs_running", "Running jobs for partition", labels, nil),
+		gpuIdle:      prometheus.NewDesc("slurm_exporter_partition_gpus_idle", "Idle GPUs for partition", labels, nil),
+		gpuAllocated: prometheus.NewDesc("slurm_exporter_partition_gpus_allocated", "Allocated GPUs for partition", labels, nil),
+		logger:       logger,
+	}
+}
+
+func (pc *PartitionsCollector) Describe(ch chan<- *prometheus.Desc) {
+	ch <- pc.cpuAllocated
+	ch <- pc.cpuIdle
+	ch <- pc.cpuOther
+	ch <- pc.cpuTotal
+	ch <- pc.jobPending
+	ch <- pc.jobRunning
+	ch <- pc.gpuIdle
+	ch <- pc.gpuAllocated
+}
+
+func (pc *PartitionsCollector) Collect(ch chan<- prometheus.Metric) {
+	for clusterLabel, cluster := range pc.clusters {
+		pm, err := ParsePartitionsMetrics(pc.logger, cluster)
+		if err != nil {
+			pc.logger.Error("Failed to parse partitions metrics", "slurm_cluster", clusterLabel, "err", err)
+			return
+		}
+		if len(pm) == 0 {
+			pc.logger.Warn("partitions collector parsed zero partitions — sinfo/squeue returned no data or output format unexpected; no slurm_partition_* series will be exposed this scrape")
+		}
+		for p := range pm {
+			ch <- prometheus.MustNewConstMetric(pc.cpuAllocated, prometheus.GaugeValue, pm[p].cpuAllocated, clusterLabel, p)
+			ch <- prometheus.MustNewConstMetric(pc.cpuIdle, prometheus.GaugeValue, pm[p].cpuIdle, clusterLabel, p)
+			ch <- prometheus.MustNewConstMetric(pc.cpuOther, prometheus.GaugeValue, pm[p].cpuOther, clusterLabel, p)
+			ch <- prometheus.MustNewConstMetric(pc.cpuTotal, prometheus.GaugeValue, pm[p].cpuTotal, clusterLabel, p)
+			ch <- prometheus.MustNewConstMetric(pc.jobPending, prometheus.GaugeValue, pm[p].jobPending, clusterLabel, p)
+			ch <- prometheus.MustNewConstMetric(pc.jobRunning, prometheus.GaugeValue, pm[p].jobRunning, clusterLabel, p)
+			ch <- prometheus.MustNewConstMetric(pc.gpuIdle, prometheus.GaugeValue, pm[p].gpuIdle, clusterLabel, p)
+			ch <- prometheus.MustNewConstMetric(pc.gpuAllocated, prometheus.GaugeValue, pm[p].gpuAllocated, clusterLabel, p)
+		}
+	}
+}

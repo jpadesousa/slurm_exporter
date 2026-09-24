@@ -1,0 +1,4 @@
+66 (null)
+4 gpu:rtxa5000:1
+4 gpu:h100:1,shard:h10
+1 gpu:mi210:2(S:0)

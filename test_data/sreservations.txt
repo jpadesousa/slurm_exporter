@@ -1,0 +1,5 @@
+ReservationName=pre-reservation-maintenance StartTime=2025-08-26T07:00:00 EndTime=2025-08-29T20:00:00 Duration=3-13:00:00
+   Nodes=node[001-102] NodeCnt=102 CoreCnt=25152 Features=(null) PartitionName=(null) Flags=SPEC_NODES,ALL_NODES
+   TRES=cpu=25152
+   Users=user01 Groups=(null) Accounts=(null) Licenses=(null) State=INACTIVE BurstBuffer=(null) Watts=n/a
+   MaxStartDelay=(null)

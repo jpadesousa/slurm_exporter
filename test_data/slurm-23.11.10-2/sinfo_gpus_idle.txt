@@ -1,0 +1,4 @@
+66 gpu:0 gpu:0
+4 gpu:rtxa5000:1 gpu:rtxa5000:0
+4 gpu:h100:1 gpu:h100:1
+1 gpu:mi210:2 gpu:mi210:2

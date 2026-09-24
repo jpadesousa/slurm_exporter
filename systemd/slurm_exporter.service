@@ -1,0 +1,45 @@
+[Unit]
+Description=Prometheus Slurm Exporter
+Documentation=https://github.com/sckyzo/slurm_exporter
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+# It is recommended to run slurm_exporter as a dedicated user, e.g., 'prometheus'.
+# You may need to create this user first with a command like:
+# useradd --no-create-home --shell /bin/false prometheus
+User=prometheus
+Group=prometheus
+
+# Update this path to where the slurm_exporter binary is located.
+# The default path after `make build` is within the project directory,
+# but you should typically copy it to /usr/local/bin/.
+ExecStart=/usr/local/bin/slurm_exporter --web.listen-address=":9341"
+
+# --- Example with GPU collector enabled ---
+# Note: The flag is --collector.gpus, not --gpus-acct as mentioned in the README.
+# ExecStart=/usr/local/bin/slurm_exporter \
+#   --web.listen-address=":9341" \
+#   --collector.gpus="true"
+
+# --- Example with only specific collectors enabled ---
+# ExecStart=/usr/local/bin/slurm_exporter \
+#   --web.listen-address=":9341" \
+#   --collector.nodes="true" \
+#   --collector.queue="true" \
+#   --collector.cpus="true" \
+#   --no-collector.scheduler \
+#   --no-collector.partitions
+
+# --- Example with TLS and basic auth ---
+# See the exporter-toolkit documentation for web-config.yml format.
+# ExecStart=/usr/local/bin/slurm_exporter \
+#   --web.listen-address=":9341" \
+#   --web.config.file="/etc/slurm_exporter/web-config.yml"
+
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

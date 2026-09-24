@@ -1,0 +1,176 @@
+# .goreleaser.yaml
+
+version: 2
+
+project_name: slurm_exporter
+
+# Release configuration
+release:
+  github:
+    owner: sckyzo
+  name_template: "{{ .ProjectName }} v{{ .Version }}"
+  # Auto-detect pre-release tags (anything containing "-", e.g. v1.8.2-rc1)
+  # and mark them as pre-release on GitHub. Stable tags (v1.8.2) are published
+  # as normal releases. See docs/release-process.md section "Test on a real
+  # platform before tagging" for the RC workflow.
+  prerelease: auto
+
+builds:
+  - id: slurm_exporter
+    goos:
+      - linux
+      - windows
+      - darwin
+    goarch:
+      - amd64
+      - 386
+      - arm64
+    binary: "{{ .ProjectName }}"
+    main: "./cmd/slurm_exporter"
+    ldflags:
+      - "-s -w"
+      - "-X=github.com/prometheus/common/version.Version={{.Version}}"
+      - "-X=github.com/prometheus/common/version.Revision={{.Commit}}"
+      - "-X=github.com/prometheus/common/version.Branch={{.Branch}}"
+      - "-X=github.com/prometheus/common/version.BuildUser={{.Env.BUILD_USER}}"
+      - "-X=github.com/prometheus/common/version.BuildDate={{.Env.BUILD_DATE}}"
+    env:
+      - CGO_ENABLED=0
+
+archives:
+  - id: slurm_exporter-release-archive
+    name_template: "{{ .ProjectName }}-{{ .Version }}-{{ .Os }}-{{ .Arch }}"
+    files:
+      - README.md
+      - LICENSE
+
+checksum:
+  name_template: "{{ .ProjectName }}_checksums.txt"
+
+# Supply-chain artefacts. Three things are produced and verifiable on every
+# release:
+#
+#   1. SBOM (CycloneDX) per archive — what's inside each tarball/zip.
+#   2. Cosign signature on the checksum file — proves the release artefacts
+#      weren't tampered with after build.
+#   3. Cosign signatures on every Docker manifest — see docker_signs below.
+#
+# All signatures are keyless via Sigstore: the build identity is the GitHub
+# Actions workflow itself, attested by the runner's OIDC token. Consumers
+# verify with `cosign verify <image>` (see docker/README.md).
+sboms:
+  - artifacts: archive
+
+signs:
+  - cmd: cosign
+    signature: "${artifact}.sigstore.json"
+    args:
+      - sign-blob
+      - "--bundle=${signature}"
+      - "${artifact}"
+      - "--yes"
+    artifacts: checksum
+    output: true
+
+docker_signs:
+  - cmd: cosign
+    artifacts: manifests
+    output: true
+    args:
+      - sign
+      - "--yes"
+      - "${artifact}@${digest}"
+
+# Docker images. Two variants (standard + minimal), both pushed as multi-arch
+# manifests (linux/amd64 + linux/arm64) to GHCR and Docker Hub on every
+# release tag.
+#
+# dockers_v2 collapses what would otherwise be 4 dockers + 16 docker_manifests
+# entries (per-arch builds + manifest combinations × variants × registries)
+# into 2 entries. GoReleaser handles multi-arch + multi-registry transparently.
+#
+# Floating tags (latest, vX.Y, vX) are skipped on pre-release tags (v1.9.0-rc1)
+# so they always point at a stable release.
+dockers_v2:
+  - id: standard
+    dockerfile: Dockerfile
+    images:
+      - "ghcr.io/sckyzo/slurm_exporter"
+      - "docker.io/sckyzo/slurm-exporter"
+    tags:
+      - "{{ .Version }}"
+      - '{{ if eq .Prerelease "" }}{{ .Major }}.{{ .Minor }}{{ end }}'
+      - '{{ if eq .Prerelease "" }}{{ .Major }}{{ end }}'
+      - '{{ if eq .Prerelease "" }}latest{{ end }}'
+    platforms:
+      - linux/amd64
+      - linux/arm64
+    sbom: "true"
+    labels:
+      "org.opencontainers.image.title": "slurm_exporter"
+      "org.opencontainers.image.description": "Prometheus exporter for the Slurm workload manager"
+      "org.opencontainers.image.licenses": "GPL-3.0-only"
+      "org.opencontainers.image.source": "https://github.com/SckyzO/slurm_exporter"
+      "org.opencontainers.image.documentation": "https://github.com/SckyzO/slurm_exporter/blob/master/docker/README.md"
+      "org.opencontainers.image.created": "{{ .Date }}"
+      "org.opencontainers.image.revision": "{{ .FullCommit }}"
+      "org.opencontainers.image.version": "{{ .Version }}"
+    build_args:
+      VERSION: "{{ .Version }}"
+      COMMIT: "{{ .FullCommit }}"
+      BRANCH: "{{ .Branch }}"
+      BUILD_USER: "goreleaser"
+      BUILD_DATE: "{{ .Date }}"
+
+  - id: minimal
+    dockerfile: Dockerfile.minimal
+    images:
+      - "ghcr.io/sckyzo/slurm_exporter"
+      - "docker.io/sckyzo/slurm-exporter"
+    tags:
+      - "{{ .Version }}-minimal"
+      - '{{ if eq .Prerelease "" }}{{ .Major }}.{{ .Minor }}-minimal{{ end }}'
+      - '{{ if eq .Prerelease "" }}{{ .Major }}-minimal{{ end }}'
+      - '{{ if eq .Prerelease "" }}latest-minimal{{ end }}'
+    platforms:
+      - linux/amd64
+      - linux/arm64
+    sbom: "true"
+    labels:
+      "org.opencontainers.image.title": "slurm_exporter (minimal)"
+      "org.opencontainers.image.description": "Prometheus exporter for the Slurm workload manager (minimal variant, bring your own slurm-client)"
+      "org.opencontainers.image.licenses": "GPL-3.0-only"
+      "org.opencontainers.image.source": "https://github.com/SckyzO/slurm_exporter"
+      "org.opencontainers.image.documentation": "https://github.com/SckyzO/slurm_exporter/blob/master/docker/README.md"
+      "org.opencontainers.image.created": "{{ .Date }}"
+      "org.opencontainers.image.revision": "{{ .FullCommit }}"
+      "org.opencontainers.image.version": "{{ .Version }}"
+    build_args:
+      VERSION: "{{ .Version }}"
+      COMMIT: "{{ .FullCommit }}"
+      BRANCH: "{{ .Branch }}"
+      BUILD_USER: "goreleaser"
+      BUILD_DATE: "{{ .Date }}"
+
+changelog:
+  sort: asc
+  use: github
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^ci:"
+      - "^chore:"
+      - "^style:"
+      - "^refactor:"
+      - "^perf:"
+      - "^build:"
+  groups:
+    - title: "🚀 Features"
+      regexp: "^.*feat[(\\w)]*:+.*$"
+      order: 0
+    - title: "🐛 Bug Fixes"
+      regexp: "^.*fix[(\\w)]*:+.*$"
+      order: 1
+    - title: "🔧 Other Changes"
+      order: 999

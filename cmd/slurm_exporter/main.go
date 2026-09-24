@@ -1,0 +1,352 @@
+/* Copyright 2017-2020 Victor Penso, Matteo Dessalvi, Joeri Hermans
+
+This program is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with this program.  If not, see <http://www.gnu.org/licenses/>. */
+
+package main
+
+import (
+	"context"
+	"net/http"
+	"os"
+	"os/signal"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/alecthomas/kingpin/v2"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/prometheus/common/version"
+	"github.com/prometheus/exporter-toolkit/web"
+	webflag "github.com/prometheus/exporter-toolkit/web/kingpinflag"
+
+	"github.com/sckyzo/slurm_exporter/internal/collector"
+	"github.com/sckyzo/slurm_exporter/internal/logger"
+)
+
+var (
+	// Command-line flags for application configuration
+	commandTimeout = kingpin.Flag("command.timeout", "Timeout for executing Slurm commands.").Default("5s").Duration()
+	logLevel       = kingpin.Flag("log.level", "Only log messages with the given severity or above. One of: [debug, info, warn, error]").Default("info").Enum("debug", "info", "warn", "error")
+	logFormat      = kingpin.Flag("log.format", "Log format. One of: [json, text]").Default("text").Enum("json", "text")
+	toolkitFlags   = webflag.AddFlags(kingpin.CommandLine, ":9341")
+
+	// disableExporterMetrics removes Go runtime and process metrics from /metrics.
+	// Useful when scraping with a dedicated Go runtime exporter.
+	disableExporterMetrics = kingpin.Flag(
+		"web.disable-exporter-metrics",
+		"Exclude Go runtime and process metrics from /metrics endpoint.",
+	).Default("false").Bool()
+
+	// nodesFeatureSet controls whether active_feature_set label is included in nodes metrics
+	nodesFeatureSet = kingpin.Flag(
+		"collector.nodes.feature-set",
+		"Include active_feature_set label in slurm_nodes_* metrics. "+
+			"Disable on homogeneous clusters to reduce cardinality.",
+	).Default("true").Bool()
+
+	// queueUserLabel controls whether the user label is included in queue metrics.
+	queueUserLabel = kingpin.Flag(
+		"collector.queue.user-label",
+		"Include user label in slurm_queue_* and slurm_cores_* metrics. "+
+			"Disable on clusters with many users to reduce cardinality.",
+	).Default("true").Bool()
+
+	// fairshareUserMetrics controls whether per-user fairshare metrics are collected.
+	fairshareUserMetrics = kingpin.Flag(
+		"collector.fairshare.user-metrics",
+		"Collect per-user fairshare metrics (slurm_user_fairshare_*). "+
+			"Disable on clusters with many users to reduce cardinality "+
+			"(each user generates 5 additional time series).",
+	).Default("true").Bool()
+
+	// sacctEfficiencyInterval controls how often the sacct_efficiency collector
+	// refreshes its cache in the background. Set to a high value on busy clusters.
+	sacctEfficiencyInterval = kingpin.Flag(
+		"collector.sacct.interval",
+		"Background refresh interval for the sacct_efficiency collector. "+
+			"sacct is never called more frequently than this regardless of scrape interval.",
+	).Default("5m").Duration()
+
+	// sacctEfficiencyLookback controls the time window for sacct queries.
+	sacctEfficiencyLookback = kingpin.Flag(
+		"collector.sacct.lookback",
+		"Time window for sacct_efficiency queries (how far back to look for completed jobs). "+
+			"Shorter windows reduce DB load; longer windows give better statistics.",
+	).Default("1h").Duration()
+
+	// slurmBinPath is the directory where Slurm binaries are looked up.
+	// Empty string (default) means binaries must be on the system $PATH.
+	slurmBinPath = kingpin.Flag(
+		"slurm.bin-path",
+		"Directory containing Slurm binaries (sinfo, squeue, sdiag, ...). "+
+			"Defaults to $PATH lookup. Required when running in a container "+
+			"where Slurm binaries are mounted from the host.",
+	).Default("").String()
+
+	// slurmClusters is the list of Slurm cluster names to query.
+	// Multiple clusters can be provided as comma-separated values.
+	slurmClusters = kingpin.Flag(
+		"slurm.cluster",
+		"Slurm cluster names to use, separated by commas.",
+	).Default("").Strings()
+
+	// collectorState stores the enabled/disabled state of each collector
+	collectorState = make(map[string]*bool)
+)
+
+// clustersMap splits the list of Slurm cluster names into a map with the
+// cluster as the key and value.
+func clustersMap(values []string) map[string]string {
+	clusters := make(map[string]string)
+
+	for _, value := range values {
+		for _, name := range strings.Split(value, ",") {
+			name = strings.TrimSpace(name)
+			if name == "" {
+				continue
+			}
+
+			clusters[name] = name
+		}
+	}
+
+	return clusters
+}
+
+// collectorConstructors maps collector names to their constructor functions
+var collectorConstructors = map[string]func(logger *logger.Logger) prometheus.Collector{
+	"accounts": func(l *logger.Logger) prometheus.Collector {
+		return collector.NewAccountsCollector(l, clustersMap(*slurmClusters))
+	},
+	"cpus": func(l *logger.Logger) prometheus.Collector {
+		return collector.NewCPUsCollector(l, clustersMap(*slurmClusters))
+	},
+	"nodes": func(l *logger.Logger) prometheus.Collector {
+		return collector.NewNodesCollector(l, *nodesFeatureSet, clustersMap(*slurmClusters))
+	},
+	"node": func(l *logger.Logger) prometheus.Collector {
+		return collector.NewNodeCollector(l, clustersMap(*slurmClusters))
+	},
+	"drain_reason": func(l *logger.Logger) prometheus.Collector {
+		return collector.NewDrainReasonCollector(l, clustersMap(*slurmClusters))
+	},
+	"partitions": func(l *logger.Logger) prometheus.Collector {
+		return collector.NewPartitionsCollector(l, clustersMap(*slurmClusters))
+	},
+	"queue": func(l *logger.Logger) prometheus.Collector {
+		return collector.NewQueueCollector(l, *queueUserLabel, clustersMap(*slurmClusters))
+	},
+	"scheduler": func(l *logger.Logger) prometheus.Collector {
+		return collector.NewSchedulerCollector(l, clustersMap(*slurmClusters))
+	},
+	"fairshare": func(l *logger.Logger) prometheus.Collector {
+		return collector.NewFairShareCollector(l, *fairshareUserMetrics, clustersMap(*slurmClusters))
+	},
+	"users": func(l *logger.Logger) prometheus.Collector {
+		return collector.NewUsersCollector(l, clustersMap(*slurmClusters))
+	},
+	"jobs": func(l *logger.Logger) prometheus.Collector {
+		return collector.NewJobsCollector(l, clustersMap(*slurmClusters))
+	},
+	"job_efficiency": func(l *logger.Logger) prometheus.Collector {
+		return collector.NewJobEffCollector(l, clustersMap(*slurmClusters))
+	},
+	"info": func(l *logger.Logger) prometheus.Collector { return collector.NewSlurmInfoCollector(l) },
+	"gpus": func(l *logger.Logger) prometheus.Collector {
+		return collector.NewGPUsCollector(l, clustersMap(*slurmClusters))
+	},
+	"gpus_node": func(l *logger.Logger) prometheus.Collector {
+		return collector.NewNodeGPUsCollector(l, clustersMap(*slurmClusters))
+	},
+	"reservations": func(l *logger.Logger) prometheus.Collector {
+		return collector.NewReservationsCollector(l, clustersMap(*slurmClusters))
+	},
+	"reservation_nodes": func(l *logger.Logger) prometheus.Collector { return collector.NewReservationNodesCollector(l) },
+	"licenses":          func(l *logger.Logger) prometheus.Collector { return collector.NewLicensesCollector(l) },
+	// sacct_efficiency constructor is overridden in main() with a signal-aware
+	// context so the background refresh goroutine is cancelled cleanly on
+	// SIGTERM/SIGINT (see issue #18). Left nil here — disabled-by-default
+	// means the constructor is never invoked through this map directly.
+	"sacct_efficiency": nil,
+}
+
+// indexHTML is the HTML content displayed on the root page
+const indexHTML = `<html>
+	<head><title>Slurm Exporter</title></head>
+	<body>
+		<h1>Slurm Exporter</h1>
+		<p>Welcome to the Slurm Exporter. Click <a href='/metrics'>here</a> to see the metrics.</p>
+	</body>
+</html>`
+
+// registerCollectors registers enabled collectors with the Prometheus registry.
+// All enabled collectors are wrapped by a single StatusTracker that emits
+// per-collector health metrics (success, duration) without desc conflicts.
+func registerCollectors(reg *prometheus.Registry, log *logger.Logger) {
+	tracker := collector.NewStatusTracker(log)
+	for name, constructor := range collectorConstructors {
+		if *collectorState[name] {
+			tracker.Add(name, constructor(log))
+			log.Info("Collector enabled", "collector", name)
+		} else {
+			log.Info("Collector disabled", "collector", name)
+		}
+	}
+	reg.MustRegister(tracker)
+}
+
+func main() {
+	// Collectors that are disabled by default (opt-in) because they are expensive
+	// or have side effects that require explicit configuration.
+	disabledByDefault := map[string]bool{
+		"sacct_efficiency": true,
+	}
+
+	for name := range collectorConstructors {
+		defaultVal := "true"
+		if disabledByDefault[name] {
+			defaultVal = "false"
+		}
+		help := "Enable the " + name + " collector."
+		if name == "sacct_efficiency" {
+			help = "Enable the sacct_efficiency collector (disabled by default — sacct queries SlurmDBD, use --collector.sacct.interval and --collector.sacct.lookback to tune)."
+		}
+		collectorState[name] = kingpin.Flag("collector."+name, help).Default(defaultVal).Bool()
+	}
+
+	kingpin.Version(version.Print("slurm_exporter"))
+	kingpin.HelpFlag.Short('h')
+	kingpin.Parse()
+
+	var log *logger.Logger
+	if *logFormat == "json" {
+		log = logger.NewJSONLogger(*logLevel)
+	} else {
+		log = logger.NewTextLogger(*logLevel)
+	}
+
+	collector.SetCommandTimeout(*commandTimeout)
+
+	// Configure Slurm binary path and validate at startup.
+	collector.SetBinPath(*slurmBinPath)
+	if *slurmBinPath != "" {
+		log.Info("Using custom Slurm binary path", "path", *slurmBinPath)
+		if errs := collector.ValidateBinaries(log, collector.SlurmBinaries); len(errs) > 0 {
+			for _, err := range errs {
+				log.Error("Slurm binary validation failed", "err", err)
+			}
+			os.Exit(1)
+		}
+	}
+
+	// clusters stores the configuration for each cluster
+	// clusters := make(map[string]collector.ClusterConfig)
+
+	// for _, name := range strings.Split(*slurmClusters, ",") {
+	// 	name = strings.TrimSpace(name)
+	// 	if name == "" {
+	// 		continue
+	// 	}
+
+	// 	clusters[name] = collector.ClusterConfig{
+	// 		Cluster: name,
+	// 	}
+	// }
+
+	// Create a signal-aware context so background goroutines (e.g. sacct_efficiency)
+	// are cancelled cleanly on SIGTERM or SIGINT (issue #18). Placed after the
+	// binary validation block to avoid a defer-skipped-by-os.Exit ordering issue.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
+	defer stop()
+
+	// sacctDone captures the Done() channel of the sacct_efficiency collector
+	// (if enabled) so we can wait for its background goroutine to fully exit
+	// after the HTTP server has shut down. Stays nil if the collector is
+	// disabled — the post-server wait below is a no-op in that case.
+	var sacctDone <-chan struct{}
+
+	// Wire the signal context into the sacct_efficiency collector constructor
+	// and capture its Done() channel for graceful shutdown.
+	collectorConstructors["sacct_efficiency"] = func(l *logger.Logger) prometheus.Collector {
+		c := collector.NewSacctEfficiencyCollector(l, *sacctEfficiencyInterval, *sacctEfficiencyLookback)
+		c.Start(ctx)
+		sacctDone = c.Done()
+		return c
+	}
+
+	// Create a custom registry to avoid global state and third-party metric pollution
+	reg := prometheus.NewRegistry()
+
+	// Register internal Execute() performance metrics (duration histogram + error counter)
+	collector.RegisterExecMetrics(reg)
+
+	// Register internal cache age metrics
+	collector.RegisterCacheMetrics(reg)
+
+	// Always register build info; Go runtime and process collectors are optional.
+	reg.MustRegister(collectors.NewBuildInfoCollector())
+	if !*disableExporterMetrics {
+		reg.MustRegister(
+			collectors.NewGoCollector(),
+			collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
+		)
+	}
+
+	// Register enabled Slurm collectors
+	registerCollectors(reg, log)
+
+	log.Info("Starting Slurm Exporter server...")
+	log.Info("Command timeout configured", "timeout", *commandTimeout)
+
+	// Configure HTTP routes
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(indexHTML))
+	})
+	http.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{
+		EnableOpenMetrics: true,
+	}))
+	// /healthz returns 200 OK as long as the HTTP server is up.
+	// This allows orchestrators (Kubernetes, systemd watchdog) to distinguish
+	// "exporter process alive" from "Slurm commands reachable".
+	http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+
+	// Start HTTP server with exporter toolkit (supports TLS, Basic Auth, etc.)
+	server := &http.Server{
+		ReadHeaderTimeout: 5 * time.Second, // Mitigate Slowloris attack (G112)
+	}
+	if err := web.ListenAndServe(server, toolkitFlags, log.Logger); err != nil {
+		log.Error("Failed to start HTTP server", "err", err)
+		stop()     // release signal handler explicitly before bypassing defer via os.Exit
+		os.Exit(1) //nolint:gocritic // stop() called explicitly above
+	}
+
+	// Graceful shutdown: wait for the sacct_efficiency background goroutine to
+	// finish (if it was started). Bounded by a short timeout so we don't hang
+	// the process when sacct is genuinely stuck.
+	if sacctDone != nil {
+		log.Info("Waiting for sacct_efficiency background goroutine to finish...")
+		select {
+		case <-sacctDone:
+			log.Info("sacct_efficiency stopped cleanly")
+		case <-time.After(5 * time.Second):
+			log.Warn("sacct_efficiency did not stop within 5s, exiting anyway")
+		}
+	}
+}
