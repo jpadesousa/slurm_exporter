@@ -16,7 +16,7 @@
 #
 # See docker/README.md for compose examples and troubleshooting.
 
-FROM ubuntu:26.04@sha256:e153663f92c94118ff22a5dc397b59b351ffd695480566debb5850e017e5937a
+FROM ubuntu:26.04@sha256:da6fc2be547864451aa253836dd926da33623312df4a9a243e35dc877c378a78
 
 # slurm-client provides sinfo/squeue/sdiag/scontrol/sshare/sacct.
 # Ubuntu 26.04 ships Slurm 25.11.x, compatible with slurmctld 23.x → 26.x in
