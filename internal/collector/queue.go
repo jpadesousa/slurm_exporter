@@ -1,0 +1,484 @@
+package collector
+
+import (
+	"strconv"
+	"strings"
+
+	"github.com/prometheus/client_golang/prometheus"
+
+	"gitea.psi.ch/agosti_j/slurm_exporter/internal/logger"
+)
+
+type NNVal map[string]map[string]map[string]float64
+type NVal map[string]map[string]float64
+
+type QueueMetrics struct {
+	pending      NNVal
+	running      NVal
+	suspended    NVal
+	cancelled    NVal
+	completing   NVal
+	completed    NVal
+	configuring  NVal
+	failed       NVal
+	timeout      NVal
+	preempted    NVal
+	nodeFail     NVal
+	cPending     NNVal
+	cRunning     NVal
+	cSuspended   NVal
+	cCancelled   NVal
+	cCompleting  NVal
+	cCompleted   NVal
+	cConfiguring NVal
+	cFailed      NVal
+	cTimeout     NVal
+	cPreempted   NVal
+	cNodeFail    NVal
+	cluster      string
+}
+
+func QueueGetMetrics(logger *logger.Logger, cluster string) (*QueueMetrics, error) {
+	data, err := QueueData(logger, cluster)
+	if err != nil {
+		return nil, err
+	}
+	qm := ParseQueueMetrics(data)
+	qm.cluster = cluster
+	return qm, nil
+}
+
+func (s *NVal) Incr(user string, part string, count float64) {
+	child, ok := (*s)[user]
+	if !ok {
+		child = map[string]float64{}
+		(*s)[user] = child
+		child[part] = 0
+	}
+	child[part] += count
+}
+
+func (s *NNVal) Incr2(reason string, user string, part string, count float64) {
+	_, ok := (*s)[reason]
+	if !ok {
+		child := map[string]map[string]float64{}
+		(*s)[reason] = child
+	}
+	child2, ok := (*s)[reason][user]
+	if !ok {
+		child2 = map[string]float64{}
+		(*s)[reason][user] = child2
+	}
+	child2[part] += count
+}
+
+/*
+ParseQueueMetrics parses the output of the squeue command for queue metrics.
+Expected input format: "%P,%T,%C,%r,%u" (Partition,State,CPUs,Reason,User).
+*/
+func ParseQueueMetrics(input []byte) *QueueMetrics {
+	qm := QueueMetrics{
+		pending:      make(NNVal),
+		running:      make(NVal),
+		suspended:    make(NVal),
+		cancelled:    make(NVal),
+		completing:   make(NVal),
+		completed:    make(NVal),
+		configuring:  make(NVal),
+		failed:       make(NVal),
+		timeout:      make(NVal),
+		preempted:    make(NVal),
+		nodeFail:     make(NVal),
+		cPending:     make(NNVal),
+		cRunning:     make(NVal),
+		cSuspended:   make(NVal),
+		cCancelled:   make(NVal),
+		cCompleting:  make(NVal),
+		cCompleted:   make(NVal),
+		cConfiguring: make(NVal),
+		cFailed:      make(NVal),
+		cTimeout:     make(NVal),
+		cPreempted:   make(NVal),
+		cNodeFail:    make(NVal),
+		cluster:      "",
+	}
+	for line := range strings.SplitSeq(string(input), "\n") {
+		if strings.Contains(line, "|") {
+			// SplitN with 5 keeps a reason field that may itself contain pipes
+			fields := strings.SplitN(line, "|", 5)
+			if len(fields) < 5 {
+				continue
+			}
+			// Strip the default-partition marker (*) so labels are consistent
+			// with the partitions and nodes collectors. squeue -o "%P" emits
+			// "compute*" for the default partition on some Slurm versions; the
+			// same fix as in partitions.go (issue #20) is applied here so any
+			// PromQL join on the partition label works as expected.
+			part := strings.TrimRight(strings.TrimSpace(fields[0]), "*")
+			state := fields[1]
+			coresI, _ := strconv.Atoi(fields[2])
+			cores := float64(coresI)
+			reason := fields[3]
+			user := strings.TrimSpace(fields[4])
+			switch state {
+			case "PENDING":
+				qm.pending.Incr2(reason, user, part, 1)
+				qm.cPending.Incr2(reason, user, part, cores)
+			case "RUNNING":
+				qm.running.Incr(user, part, 1)
+				qm.cRunning.Incr(user, part, cores)
+			case "SUSPENDED":
+				qm.suspended.Incr(user, part, 1)
+				qm.cSuspended.Incr(user, part, cores)
+			case "CANCELLED":
+				qm.cancelled.Incr(user, part, 1)
+				qm.cCancelled.Incr(user, part, cores)
+			case "COMPLETING":
+				qm.completing.Incr(user, part, 1)
+				qm.cCompleting.Incr(user, part, cores)
+			case "COMPLETED":
+				qm.completed.Incr(user, part, 1)
+				qm.cCompleted.Incr(user, part, cores)
+			case "CONFIGURING":
+				qm.configuring.Incr(user, part, 1)
+				qm.cConfiguring.Incr(user, part, cores)
+			case "FAILED":
+				qm.failed.Incr(user, part, 1)
+				qm.cFailed.Incr(user, part, cores)
+			case "TIMEOUT":
+				qm.timeout.Incr(user, part, 1)
+				qm.cTimeout.Incr(user, part, cores)
+			case "PREEMPTED":
+				qm.preempted.Incr(user, part, 1)
+				qm.cPreempted.Incr(user, part, cores)
+			case "NODE_FAIL":
+				qm.nodeFail.Incr(user, part, 1)
+				qm.cNodeFail.Incr(user, part, cores)
+			}
+		}
+	}
+	return &qm
+}
+
+/*
+QueueData executes the squeue command to retrieve queue information.
+Expected squeue output format: "%P,%T,%C,%r,%u" (Partition,State,CPUs,Reason,User).
+*/
+func QueueData(logger *logger.Logger, cluster string) ([]byte, error) {
+	args := []string{"--state=all", "-a", "-h", "-o", "%P|%T|%C|%r|%u"}
+	if cluster != "" {
+		args = append([]string{"-M", cluster}, args...)
+	}
+	return Execute(logger, "squeue", args)
+}
+
+/*
+ * Implement the Prometheus Collector interface and feed the
+ * Slurm queue metrics into it.
+ * https://godoc.org/github.com/prometheus/client_golang/prometheus#Collector
+ */
+
+// NewQueueCollector creates a queue metrics collector.
+// When withUserLabel is false, the user label is omitted and counts are
+// aggregated per partition only, reducing cardinality on large clusters.
+func NewQueueCollector(logger *logger.Logger, withUserLabel bool, clusters map[string]string) *QueueCollector {
+	var labelsJob, labelsPending []string
+	if withUserLabel {
+		labelsJob = []string{"user", "partition", "slurm_cluster"}
+		labelsPending = []string{"user", "partition", "reason", "slurm_cluster"}
+	} else {
+		labelsJob = []string{"partition", "slurm_cluster"}
+		labelsPending = []string{"partition", "reason", "slurm_cluster"}
+	}
+	cluster_label := []string{"slurm_cluster"}
+	return &QueueCollector{
+		clusters:         clusters,
+		withUserLabel:    withUserLabel,
+		pending:          prometheus.NewDesc("slurm_exporter_queue_pending", "Pending jobs in queue", labelsPending, nil),
+		running:          prometheus.NewDesc("slurm_exporter_queue_running", "Running jobs in the cluster", labelsJob, nil),
+		suspended:        prometheus.NewDesc("slurm_exporter_queue_suspended", "Suspended jobs in the cluster", labelsJob, nil),
+		cancelled:        prometheus.NewDesc("slurm_exporter_queue_cancelled", "Cancelled jobs in the cluster", labelsJob, nil),
+		completing:       prometheus.NewDesc("slurm_exporter_queue_completing", "Completing jobs in the cluster", labelsJob, nil),
+		completed:        prometheus.NewDesc("slurm_exporter_queue_completed", "Completed jobs in the cluster", labelsJob, nil),
+		configuring:      prometheus.NewDesc("slurm_exporter_queue_configuring", "Configuring jobs in the cluster", labelsJob, nil),
+		failed:           prometheus.NewDesc("slurm_exporter_queue_failed", "Number of failed jobs", labelsJob, nil),
+		timeout:          prometheus.NewDesc("slurm_exporter_queue_timeout", "Jobs stopped by timeout", labelsJob, nil),
+		preempted:        prometheus.NewDesc("slurm_exporter_queue_preempted", "Number of preempted jobs", labelsJob, nil),
+		nodeFail:         prometheus.NewDesc("slurm_exporter_queue_node_fail", "Number of jobs stopped due to node fail", labelsJob, nil),
+		coresPending:     prometheus.NewDesc("slurm_exporter_cores_pending", "Pending cores in queue", labelsPending, nil),
+		coresRunning:     prometheus.NewDesc("slurm_exporter_cores_running", "Running cores in the cluster", labelsJob, nil),
+		coresSuspended:   prometheus.NewDesc("slurm_exporter_cores_suspended", "Suspended cores in the cluster", labelsJob, nil),
+		coresCancelled:   prometheus.NewDesc("slurm_exporter_cores_cancelled", "Cancelled cores in the cluster", labelsJob, nil),
+		coresCompleting:  prometheus.NewDesc("slurm_exporter_cores_completing", "Completing cores in the cluster", labelsJob, nil),
+		coresCompleted:   prometheus.NewDesc("slurm_exporter_cores_completed", "Completed cores in the cluster", labelsJob, nil),
+		coresConfiguring: prometheus.NewDesc("slurm_exporter_cores_configuring", "Configuring cores in the cluster", labelsJob, nil),
+		coresFailed:      prometheus.NewDesc("slurm_exporter_cores_failed", "Number of failed cores", labelsJob, nil),
+		coresTimeout:     prometheus.NewDesc("slurm_exporter_cores_timeout", "Cores stopped by timeout", labelsJob, nil),
+		coresPreempted:   prometheus.NewDesc("slurm_exporter_cores_preempted", "Number of preempted cores", labelsJob, nil),
+		coresNodeFail:    prometheus.NewDesc("slurm_exporter_cores_node_fail", "Number of cores stopped due to node fail", labelsJob, nil),
+		// Global totals — no labels, always emitted even when 0
+		jobsPending:      prometheus.NewDesc("slurm_exporter_jobs_pending", "Total pending jobs in the cluster", cluster_label, nil),
+		jobsRunning:      prometheus.NewDesc("slurm_exporter_jobs_running", "Total running jobs in the cluster", cluster_label, nil),
+		jobsSuspended:    prometheus.NewDesc("slurm_exporter_jobs_suspended", "Total suspended jobs in the cluster", cluster_label, nil),
+		jobsCompleting:   prometheus.NewDesc("slurm_exporter_jobs_completing", "Total completing jobs in the cluster", cluster_label, nil),
+		jobsCompleted:    prometheus.NewDesc("slurm_exporter_jobs_completed", "Total completed jobs in the cluster", cluster_label, nil),
+		jobsConfiguring:  prometheus.NewDesc("slurm_exporter_jobs_configuring", "Total configuring jobs in the cluster", cluster_label, nil),
+		jobsFailed:       prometheus.NewDesc("slurm_exporter_jobs_failed", "Total failed jobs in the cluster", cluster_label, nil),
+		jobsTimeout:      prometheus.NewDesc("slurm_exporter_jobs_timeout", "Total jobs stopped by timeout in the cluster", cluster_label, nil),
+		jobsPreempted:    prometheus.NewDesc("slurm_exporter_jobs_preempted", "Total preempted jobs in the cluster", cluster_label, nil),
+		jobsNodeFail:     prometheus.NewDesc("slurm_exporter_jobs_node_fail", "Total jobs stopped due to node fail in the cluster", cluster_label, nil),
+		jobsCancelled:    prometheus.NewDesc("slurm_exporter_jobs_cancelled", "Total cancelled jobs in the cluster", cluster_label, nil),
+		jobsCoresRunning: prometheus.NewDesc("slurm_exporter_jobs_cores_running", "Total cores used by running jobs", cluster_label, nil),
+		jobsCoresPending: prometheus.NewDesc("slurm_exporter_jobs_cores_pending", "Total cores requested by pending jobs", cluster_label, nil),
+		logger:           logger,
+	}
+}
+
+type QueueCollector struct {
+	clusters         map[string]string
+	pending          *prometheus.Desc
+	running          *prometheus.Desc
+	suspended        *prometheus.Desc
+	cancelled        *prometheus.Desc
+	completing       *prometheus.Desc
+	completed        *prometheus.Desc
+	configuring      *prometheus.Desc
+	failed           *prometheus.Desc
+	timeout          *prometheus.Desc
+	preempted        *prometheus.Desc
+	nodeFail         *prometheus.Desc
+	coresPending     *prometheus.Desc
+	coresRunning     *prometheus.Desc
+	coresSuspended   *prometheus.Desc
+	coresCancelled   *prometheus.Desc
+	coresCompleting  *prometheus.Desc
+	coresCompleted   *prometheus.Desc
+	coresConfiguring *prometheus.Desc
+	coresFailed      *prometheus.Desc
+	coresTimeout     *prometheus.Desc
+	coresPreempted   *prometheus.Desc
+	coresNodeFail    *prometheus.Desc
+	withUserLabel    bool
+	// Global totals — no labels, always emitted even when 0
+	jobsPending      *prometheus.Desc
+	jobsRunning      *prometheus.Desc
+	jobsSuspended    *prometheus.Desc
+	jobsCompleting   *prometheus.Desc
+	jobsCompleted    *prometheus.Desc
+	jobsConfiguring  *prometheus.Desc
+	jobsFailed       *prometheus.Desc
+	jobsTimeout      *prometheus.Desc
+	jobsPreempted    *prometheus.Desc
+	jobsNodeFail     *prometheus.Desc
+	jobsCancelled    *prometheus.Desc
+	jobsCoresRunning *prometheus.Desc
+	jobsCoresPending *prometheus.Desc
+	logger           *logger.Logger
+}
+
+func (qc *QueueCollector) Describe(ch chan<- *prometheus.Desc) {
+	ch <- qc.pending
+	ch <- qc.running
+	ch <- qc.suspended
+	ch <- qc.cancelled
+	ch <- qc.completing
+	ch <- qc.completed
+	ch <- qc.configuring
+	ch <- qc.failed
+	ch <- qc.timeout
+	ch <- qc.preempted
+	ch <- qc.nodeFail
+	ch <- qc.coresPending
+	ch <- qc.coresRunning
+	ch <- qc.coresSuspended
+	ch <- qc.coresCancelled
+	ch <- qc.coresCompleting
+	ch <- qc.coresCompleted
+	ch <- qc.coresConfiguring
+	ch <- qc.coresFailed
+	ch <- qc.coresTimeout
+	ch <- qc.coresPreempted
+	ch <- qc.coresNodeFail
+	ch <- qc.jobsPending
+	ch <- qc.jobsRunning
+	ch <- qc.jobsSuspended
+	ch <- qc.jobsCompleting
+	ch <- qc.jobsCompleted
+	ch <- qc.jobsConfiguring
+	ch <- qc.jobsFailed
+	ch <- qc.jobsTimeout
+	ch <- qc.jobsPreempted
+	ch <- qc.jobsNodeFail
+	ch <- qc.jobsCancelled
+	ch <- qc.jobsCoresRunning
+	ch <- qc.jobsCoresPending
+}
+
+func (qc *QueueCollector) Collect(ch chan<- prometheus.Metric) {
+	for _, cluster := range qc.clusters {
+		qm, err := QueueGetMetrics(qc.logger, cluster)
+		if err != nil {
+			qc.logger.Error("Failed to get queue metrics", "slurm_cluster", cluster, "err", err)
+			// Emit global totals at 0 so they remain present in Prometheus
+			// even when squeue is unavailable. Per-user metrics are omitted.
+			empty := &QueueMetrics{
+				pending: make(NNVal), running: make(NVal),
+				suspended: make(NVal), completing: make(NVal),
+				completed: make(NVal), configuring: make(NVal),
+				failed: make(NVal), timeout: make(NVal),
+				preempted: make(NVal), nodeFail: make(NVal),
+				cancelled: make(NVal),
+				cPending:  make(NNVal), cRunning: make(NVal),
+			}
+			qc.emitGlobalTotals(ch, empty, cluster)
+			return
+		}
+		if qc.withUserLabel {
+			for reason, values := range qm.pending {
+				PushMetric(values, ch, qc.pending, reason, cluster)
+			}
+			PushMetric(qm.running, ch, qc.running, "", cluster)
+			PushMetric(qm.suspended, ch, qc.suspended, "", cluster)
+			PushMetric(qm.cancelled, ch, qc.cancelled, "", cluster)
+			PushMetric(qm.completing, ch, qc.completing, "", cluster)
+			PushMetric(qm.completed, ch, qc.completed, "", cluster)
+			PushMetric(qm.configuring, ch, qc.configuring, "", cluster)
+			PushMetric(qm.failed, ch, qc.failed, "", cluster)
+			PushMetric(qm.timeout, ch, qc.timeout, "", cluster)
+			PushMetric(qm.preempted, ch, qc.preempted, "", cluster)
+			PushMetric(qm.nodeFail, ch, qc.nodeFail, "", cluster)
+			for reason, value := range qm.cPending {
+				PushMetric(value, ch, qc.coresPending, reason, cluster)
+			}
+			PushMetric(qm.cRunning, ch, qc.coresRunning, "", cluster)
+			PushMetric(qm.cSuspended, ch, qc.coresSuspended, "", cluster)
+			PushMetric(qm.cCancelled, ch, qc.coresCancelled, "", cluster)
+			PushMetric(qm.cCompleting, ch, qc.coresCompleting, "", cluster)
+			PushMetric(qm.cCompleted, ch, qc.coresCompleted, "", cluster)
+			PushMetric(qm.cConfiguring, ch, qc.coresConfiguring, "", cluster)
+			PushMetric(qm.cFailed, ch, qc.coresFailed, "", cluster)
+			PushMetric(qm.cTimeout, ch, qc.coresTimeout, "", cluster)
+			PushMetric(qm.cPreempted, ch, qc.coresPreempted, "", cluster)
+			PushMetric(qm.cNodeFail, ch, qc.coresNodeFail, "", cluster)
+		} else {
+			// user label disabled: aggregate all users per partition
+			pushAggregatedNNVal(qm.pending, ch, qc.pending, cluster)
+			pushAggregatedNVal(qm.running, ch, qc.running, "", cluster)
+			pushAggregatedNVal(qm.suspended, ch, qc.suspended, "", cluster)
+			pushAggregatedNVal(qm.cancelled, ch, qc.cancelled, "", cluster)
+			pushAggregatedNVal(qm.completing, ch, qc.completing, "", cluster)
+			pushAggregatedNVal(qm.completed, ch, qc.completed, "", cluster)
+			pushAggregatedNVal(qm.configuring, ch, qc.configuring, "", cluster)
+			pushAggregatedNVal(qm.failed, ch, qc.failed, "", cluster)
+			pushAggregatedNVal(qm.timeout, ch, qc.timeout, "", cluster)
+			pushAggregatedNVal(qm.preempted, ch, qc.preempted, "", cluster)
+			pushAggregatedNVal(qm.nodeFail, ch, qc.nodeFail, "", cluster)
+			pushAggregatedNNVal(qm.cPending, ch, qc.coresPending, cluster)
+			pushAggregatedNVal(qm.cRunning, ch, qc.coresRunning, "", cluster)
+			pushAggregatedNVal(qm.cSuspended, ch, qc.coresSuspended, "", cluster)
+			pushAggregatedNVal(qm.cCancelled, ch, qc.coresCancelled, "", cluster)
+			pushAggregatedNVal(qm.cCompleting, ch, qc.coresCompleting, "", cluster)
+			pushAggregatedNVal(qm.cCompleted, ch, qc.coresCompleted, "", cluster)
+			pushAggregatedNVal(qm.cConfiguring, ch, qc.coresConfiguring, "", cluster)
+			pushAggregatedNVal(qm.cFailed, ch, qc.coresFailed, "", cluster)
+			pushAggregatedNVal(qm.cTimeout, ch, qc.coresTimeout, "", cluster)
+			pushAggregatedNVal(qm.cPreempted, ch, qc.coresPreempted, "", cluster)
+			pushAggregatedNVal(qm.cNodeFail, ch, qc.coresNodeFail, "", cluster)
+		}
+		// Global totals: always emitted even when 0, regardless of withUserLabel.
+		qc.emitGlobalTotals(ch, qm, cluster)
+	}
+}
+
+// emitGlobalTotals emits the 13 cluster-wide job/core metrics.
+// Called both on success and on squeue error (with empty metrics) so these
+// series are always present in Prometheus, enabling reliable alerting.
+func (qc *QueueCollector) emitGlobalTotals(ch chan<- prometheus.Metric, qm *QueueMetrics, cluster string) {
+	ch <- prometheus.MustNewConstMetric(qc.jobsPending, prometheus.GaugeValue, sumNNVal(qm.pending), cluster)
+	ch <- prometheus.MustNewConstMetric(qc.jobsRunning, prometheus.GaugeValue, sumNVal(qm.running), cluster)
+	ch <- prometheus.MustNewConstMetric(qc.jobsSuspended, prometheus.GaugeValue, sumNVal(qm.suspended), cluster)
+	ch <- prometheus.MustNewConstMetric(qc.jobsCompleting, prometheus.GaugeValue, sumNVal(qm.completing), cluster)
+	ch <- prometheus.MustNewConstMetric(qc.jobsCompleted, prometheus.GaugeValue, sumNVal(qm.completed), cluster)
+	ch <- prometheus.MustNewConstMetric(qc.jobsConfiguring, prometheus.GaugeValue, sumNVal(qm.configuring), cluster)
+	ch <- prometheus.MustNewConstMetric(qc.jobsFailed, prometheus.GaugeValue, sumNVal(qm.failed), cluster)
+	ch <- prometheus.MustNewConstMetric(qc.jobsTimeout, prometheus.GaugeValue, sumNVal(qm.timeout), cluster)
+	ch <- prometheus.MustNewConstMetric(qc.jobsPreempted, prometheus.GaugeValue, sumNVal(qm.preempted), cluster)
+	ch <- prometheus.MustNewConstMetric(qc.jobsNodeFail, prometheus.GaugeValue, sumNVal(qm.nodeFail), cluster)
+	ch <- prometheus.MustNewConstMetric(qc.jobsCancelled, prometheus.GaugeValue, sumNVal(qm.cancelled), cluster)
+	ch <- prometheus.MustNewConstMetric(qc.jobsCoresRunning, prometheus.GaugeValue, sumNVal(qm.cRunning), cluster)
+	ch <- prometheus.MustNewConstMetric(qc.jobsCoresPending, prometheus.GaugeValue, sumNNVal(qm.cPending), cluster)
+}
+
+// pushAggregatedNVal aggregates NVal (user->partition->count) to {partition},
+// collapsing the user dimension. Used when --collector.queue.user-label=false.
+func pushAggregatedNVal(m NVal, ch chan<- prometheus.Metric, desc *prometheus.Desc, aLabel string, cluster string) {
+	aggregated := make(map[string]float64)
+	for _, partitionMap := range m {
+		for partition, val := range partitionMap {
+			aggregated[partition] += val
+		}
+	}
+	for partition, val := range aggregated {
+		if aLabel != "" {
+			ch <- prometheus.MustNewConstMetric(desc, prometheus.GaugeValue, val, partition, aLabel, cluster)
+		} else {
+			ch <- prometheus.MustNewConstMetric(desc, prometheus.GaugeValue, val, partition, cluster)
+		}
+	}
+}
+
+// pushAggregatedNNVal aggregates NNVal (reason->user->partition->count) to {partition, reason}.
+func pushAggregatedNNVal(m NNVal, ch chan<- prometheus.Metric, desc *prometheus.Desc, cluster string) {
+	aggregated := make(map[string]map[string]float64)
+	for reason, userMap := range m {
+		if aggregated[reason] == nil {
+			aggregated[reason] = make(map[string]float64)
+		}
+		for _, partitionMap := range userMap {
+			for partition, val := range partitionMap {
+				aggregated[reason][partition] += val
+			}
+		}
+	}
+	for reason, partitionMap := range aggregated {
+		for partition, val := range partitionMap {
+			ch <- prometheus.MustNewConstMetric(desc, prometheus.GaugeValue, val, partition, reason, cluster)
+		}
+	}
+}
+
+// sumNVal sums all values in a NVal (user->partition->count) map.
+func sumNVal(m NVal) float64 {
+	var total float64
+	for _, partitionMap := range m {
+		for _, val := range partitionMap {
+			total += val
+		}
+	}
+	return total
+}
+
+// sumNNVal sums all values in a NNVal (reason->user->partition->count) map.
+func sumNNVal(m NNVal) float64 {
+	var total float64
+	for _, userMap := range m {
+		for _, partitionMap := range userMap {
+			for _, val := range partitionMap {
+				total += val
+			}
+		}
+	}
+	return total
+}
+
+func PushMetric(m map[string]map[string]float64, ch chan<- prometheus.Metric, coll *prometheus.Desc, aLabel string, cluster string) {
+	for label1, vals1 := range m {
+		for label2, val := range vals1 {
+			if aLabel != "" {
+				ch <- prometheus.MustNewConstMetric(coll, prometheus.GaugeValue, val, label1, label2, aLabel, cluster)
+			} else {
+				ch <- prometheus.MustNewConstMetric(coll, prometheus.GaugeValue, val, label1, label2, cluster)
+			}
+		}
+	}
+}

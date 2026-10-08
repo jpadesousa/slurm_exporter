@@ -1,0 +1,181 @@
+package collector
+
+import (
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/prometheus/client_golang/prometheus"
+
+	"gitea.psi.ch/agosti_j/slurm_exporter/internal/logger"
+)
+
+// reservationKVRe matches key=value pairs in scontrol show reservation output.
+var reservationKVRe = regexp.MustCompile(`(\w+)=([^ \n]+)`)
+
+const slurmTimeLayout = "2006-01-02T15:04:05"
+
+// ReservationInfo holds information about a single reservation.
+type ReservationInfo struct {
+	Name      string
+	State     string
+	Users     string
+	Nodes     string
+	Partition string
+	Flags     string
+	NodeCount float64
+	CoreCount float64
+	StartTime time.Time
+	EndTime   time.Time
+}
+
+// ReservationsCollector collects metrics about Slurm reservations.
+type ReservationsCollector struct {
+	clusters  map[string]string
+	logger    *logger.Logger
+	info      *prometheus.Desc
+	startTime *prometheus.Desc
+	endTime   *prometheus.Desc
+	nodeCount *prometheus.Desc
+	coreCount *prometheus.Desc
+}
+
+func NewReservationsCollector(logger *logger.Logger, clusters map[string]string) *ReservationsCollector {
+	labels := []string{"reservation_name", "state", "users", "nodes", "partition", "flags", "slurm_cluster"}
+	return &ReservationsCollector{
+		clusters: clusters,
+		logger:   logger,
+		info: prometheus.NewDesc(
+			"slurm_exporter_reservation_info",
+			"A metric with a constant '1' value labeled by reservation name, state, users, nodes, partition, and flags.",
+			labels, nil,
+		),
+		startTime: prometheus.NewDesc(
+			"slurm_exporter_reservation_start_time_seconds",
+			"The start time of the reservation in seconds since the Unix epoch.",
+			[]string{"reservation_name", "slurm_cluster"}, nil,
+		),
+		endTime: prometheus.NewDesc(
+			"slurm_exporter_reservation_end_time_seconds",
+			"The end time of the reservation in seconds since the Unix epoch.",
+			[]string{"reservation_name", "slurm_cluster"}, nil,
+		),
+		nodeCount: prometheus.NewDesc(
+			"slurm_exporter_reservation_node_count",
+			"The number of nodes allocated to the reservation.",
+			[]string{"reservation_name", "slurm_cluster"}, nil,
+		),
+		coreCount: prometheus.NewDesc(
+			"slurm_exporter_reservation_core_count",
+			"The number of cores allocated to the reservation.",
+			[]string{"reservation_name", "slurm_cluster"}, nil,
+		),
+	}
+}
+
+// Describe sends the super-set of all possible descriptors of metrics
+// collected by this Collector to the provided channel.
+func (c *ReservationsCollector) Describe(ch chan<- *prometheus.Desc) {
+	ch <- c.info
+	ch <- c.startTime
+	ch <- c.endTime
+	ch <- c.nodeCount
+	ch <- c.coreCount
+}
+
+// Collect is called by the Prometheus registry when collecting metrics.
+func (c *ReservationsCollector) Collect(ch chan<- prometheus.Metric) {
+	for clusterLabel, cluster := range c.clusters {
+		data, err := c.reservationsData(cluster)
+		if err != nil {
+			c.logger.Error("Failed to fetch reservation data", "slurm_cluster", clusterLabel, "err", err)
+			return
+		}
+
+		reservations, err := parseReservations(data)
+		if err != nil {
+			c.logger.Error("Failed to parse reservation data", "slurm_cluster", clusterLabel, "err", err)
+			return
+		}
+
+		for i := range reservations {
+			res := &reservations[i]
+			labels := []string{res.Name, res.State, res.Users, res.Nodes, res.Partition, res.Flags, clusterLabel}
+			ch <- prometheus.MustNewConstMetric(c.info, prometheus.GaugeValue, 1, labels...)
+			ch <- prometheus.MustNewConstMetric(c.startTime, prometheus.GaugeValue, float64(res.StartTime.Unix()), res.Name, clusterLabel)
+			ch <- prometheus.MustNewConstMetric(c.endTime, prometheus.GaugeValue, float64(res.EndTime.Unix()), res.Name, clusterLabel)
+			ch <- prometheus.MustNewConstMetric(c.nodeCount, prometheus.GaugeValue, res.NodeCount, res.Name, clusterLabel)
+			ch <- prometheus.MustNewConstMetric(c.coreCount, prometheus.GaugeValue, res.CoreCount, res.Name, clusterLabel)
+		}
+	}
+}
+
+/*
+reservationsData executes the scontrol command to retrieve reservation information.
+Expected scontrol output format: key=value pairs for each reservation, separated by blank lines.
+*/
+func (c *ReservationsCollector) reservationsData(cluster string) ([]byte, error) {
+	args := []string{"show", "-a", "reservation"}
+	if cluster != "" {
+		args = append([]string{"-M", cluster}, args...)
+	}
+	return Execute(c.logger, "scontrol", args)
+}
+
+// setReservationField assigns one parsed key=value pair into res.
+// Unknown keys are silently ignored.
+func setReservationField(res *ReservationInfo, key, value string) {
+	switch key {
+	case "ReservationName":
+		res.Name = value
+	case "State":
+		res.State = value
+	case "Users":
+		res.Users = value
+	case "Nodes":
+		res.Nodes = value
+	case "PartitionName":
+		if value == "(null)" {
+			res.Partition = ""
+		} else {
+			res.Partition = value
+		}
+	case "Flags":
+		res.Flags = value
+	case "NodeCnt":
+		res.NodeCount, _ = strconv.ParseFloat(value, 64)
+	case "CoreCnt":
+		res.CoreCount, _ = strconv.ParseFloat(value, 64)
+	case "StartTime":
+		res.StartTime, _ = time.ParseInLocation(slurmTimeLayout, value, time.Local)
+	case "EndTime":
+		res.EndTime, _ = time.ParseInLocation(slurmTimeLayout, value, time.Local)
+	}
+}
+
+// parseReservations parses the output of `scontrol show reservation`. Records
+// are separated by blank lines, each record is a sequence of key=value pairs.
+func parseReservations(data []byte) ([]ReservationInfo, error) {
+	var reservations []ReservationInfo
+	for _, record := range strings.Split(string(data), "\n\n") {
+		if strings.TrimSpace(record) == "" {
+			continue
+		}
+		res := ReservationInfo{}
+		for _, match := range reservationKVRe.FindAllStringSubmatch(record, -1) {
+			setReservationField(&res, match[1], match[2])
+		}
+		// Skip records that didn't yield a real reservation. scontrol prints
+		// "No reservations in the system" on an empty cluster; without this
+		// guard, the parser would emit a phantom ReservationInfo with an
+		// empty Name and time.Time{} timestamps (Unix = -62135596800 = year
+		// 0001), surfacing as fake "1968-01-12" reservations on dashboards.
+		// See https://github.com/SckyzO/slurm_exporter/issues/26.
+		if res.Name == "" {
+			continue
+		}
+		reservations = append(reservations, res)
+	}
+	return reservations, nil
+}
