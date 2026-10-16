@@ -165,7 +165,7 @@ QueueData executes the squeue command to retrieve queue information.
 Expected squeue output format: "%P,%T,%C,%r,%u" (Partition,State,CPUs,Reason,User).
 */
 func QueueData(logger *logger.Logger, cluster string) ([]byte, error) {
-	args := []string{"--state=all", "-a", "-h", "-o", "%P|%T|%C|%r|%u"}
+	args := []string{"--state=all", "-a", "-r", "-h", "-o", "%P|%T|%C|%r|%u"}
 	if cluster != "" {
 		args = append([]string{"-M", cluster}, args...)
 	}

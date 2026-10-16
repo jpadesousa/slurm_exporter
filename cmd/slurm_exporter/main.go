@@ -20,10 +20,10 @@ import (
 	"gitea.psi.ch/agosti_j/slurm_exporter/internal/logger"
 )
 
-// Set version
-var version = "dev"
-
 var (
+	// Set version
+	version = "dev"
+
 	// Command-line flags for application configuration
 	commandTimeout = kingpin.Flag(
 		"command.timeout",
@@ -106,6 +106,22 @@ var (
 		"Slurm cluster names to use, separated by commas.",
 	).Default("").Strings()
 
+	// jobEfficiencyLookback specifies how far back in time to fetch job
+	// efficiency data using sacct (e.g., "6hours" or "3days").
+	jobEfficiencyLookback = kingpin.Flag(
+		"collector.job_efficiency.lookback",
+		"How far back in time to fetch job efficiency data using sacct"+
+			" (e.g., \"6hours\" or \"3days\").",
+	).Default("").String()
+
+	// jobEffRefreshTime specifies the interval in seconds between consecutive
+	// executions of the sacct command to fetch job efficiency data.
+	jobEffRefreshTime = kingpin.Flag(
+		"collector.job_efficiency.refresh-time",
+		"Interval in seconds between consecutive executions "+
+			"of the sacct command.",
+	).Default("").Int64()
+
 	// collectorState stores the enabled/disabled state of each collector
 	collectorState = make(map[string]*bool)
 )
@@ -166,12 +182,21 @@ var collectorConstructors = map[string]func(logger *logger.Logger) prometheus.Co
 		return collector.NewJobsCollector(l, clustersMap(*slurmClusters))
 	},
 	"job_efficiency": func(l *logger.Logger) prometheus.Collector {
-		c := collector.NewJobEffCollector(l, clustersMap(*slurmClusters))
+		c := collector.NewJobEffCollector(l, clustersMap(*slurmClusters), *jobEffTimeBeforeNow, *jobEffRefreshTime)
 		go c.Start()
 		return c
 	},
 	"info": func(l *logger.Logger) prometheus.Collector {
 		return collector.NewSlurmInfoCollector(l)
+	},
+	"priority": func(l *logger.Logger) prometheus.Collector {
+		return collector.NewPriorityCollector(l)
+	},
+	"qos": func(l *logger.Logger) prometheus.Collector {
+		return collector.NewQosCollector(l)
+	},
+	"sprio": func(l *logger.Logger) prometheus.Collector {
+		return collector.NewSprioCollector(l, clustersMap(*slurmClusters))
 	},
 	"gpus": func(l *logger.Logger) prometheus.Collector {
 		return collector.NewGPUsCollector(l, clustersMap(*slurmClusters))

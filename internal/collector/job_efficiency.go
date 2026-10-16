@@ -56,14 +56,19 @@ type JobEffInfo struct {
 }
 
 // JobEffData executes sacct for jobs finished within the configured interval.
-func JobEffData(logger *logger.Logger, cluster string) ([]byte, error) {
+func JobEffData(logger *logger.Logger, cluster string, timeBeforeNow string) ([]byte, error) {
+	startTime := "now-" + timeBeforeNow
+
 	args := []string{
 		"-n",
 		"-P",
-		"-S", "now-3hours",
+		"-S", startTime,
 		"-E", "now",
 		"-s", "OUT_OF_MEMORY,COMPLETED,FAILED,TIMEOUT,CANCELLED",
-		"-o", "JobID,JobName,Cluster,Partition,User,Group,Account,State,Submit,Eligible,Start,End,ElapsedRaw,TimelimitRaw,AllocNodes,AllocCPUS,CPUTimeRaw,AllocTRES,TresUsageInTot,TresUsageOutTot"}
+		"-o", "JobID,JobName,Cluster,Partition,User,Group,Account," +
+			"State,Submit,Eligible,Start,End,ElapsedRaw,TimelimitRaw," +
+			"AllocNodes,AllocCPUS,CPUTimeRaw,AllocTRES,TresUsageInTot," +
+			"TresUsageOutTot"}
 	if cluster != "" {
 		args = append([]string{"-M", cluster}, args...)
 	}
@@ -281,10 +286,10 @@ func parseTresUsage(s string) (TresUsage, error) {
 }
 
 // ParseJobEffMetrics parses sacct output into a map of base job ID to JobEffInfo.
-func ParseJobEffMetrics(logger *logger.Logger, cluster string) (map[string]*JobEffInfo, error) {
+func ParseJobEffMetrics(logger *logger.Logger, cluster string, timeBeforeNow string) (map[string]*JobEffInfo, error) {
 	jobEff := make(map[string]*JobEffInfo)
 
-	jobEffData, err := JobEffData(logger, cluster)
+	jobEffData, err := JobEffData(logger, cluster, timeBeforeNow)
 	if err != nil {
 		return nil, err
 	}
@@ -460,13 +465,13 @@ func ParseJobEffMetrics(logger *logger.Logger, cluster string) (map[string]*JobE
 	return jobEff, nil
 }
 
-// JobEffCollector collects job efficiency metrics.
 type JobEffCollector struct {
-	// Cached job efficiency data.
 	mu      sync.RWMutex
 	metrics map[string]map[string]*JobEffInfo
 
-	clusters map[string]string
+	clusters      map[string]string
+	timeBeforeNow string
+	refreshTime   int64
 
 	timeAllocated               *prometheus.Desc
 	coresAllocated              *prometheus.Desc
@@ -491,10 +496,12 @@ type JobEffCollector struct {
 }
 
 // NewJobEffCollector creates a new collector for job efficiency metrics.
-func NewJobEffCollector(logger *logger.Logger, clusters map[string]string) *JobEffCollector {
+func NewJobEffCollector(logger *logger.Logger, clusters map[string]string, timeBeforeNow string, refreshTime int64) *JobEffCollector {
 	labels := []string{"jobid", "name", "slurm_cluster", "partition", "user", "group", "account", "state"}
 	return &JobEffCollector{
-		clusters: clusters,
+		clusters:      clusters,
+		timeBeforeNow: timeBeforeNow,
+		refreshTime:   refreshTime,
 
 		timeAllocated: prometheus.NewDesc(
 			"slurm_exporter_job_eff_allocated_time_seconds",
@@ -648,8 +655,7 @@ func (jc *JobEffCollector) Start() {
 		// Refresh immediately at startup.
 		jc.refresh()
 
-		// Refresh once per hour.
-		ticker := time.NewTicker(1 * time.Hour)
+		ticker := time.NewTicker(time.Duration(jc.refreshTime) * time.Second)
 		defer ticker.Stop()
 
 		for range ticker.C {
@@ -671,7 +677,7 @@ func (jc *JobEffCollector) refresh() {
 			"cluster", clusterLabel,
 		)
 
-		jobMetrics, err := ParseJobEffMetrics(jc.logger, cluster)
+		jobMetrics, err := ParseJobEffMetrics(jc.logger, cluster, jc.timeBeforeNow)
 		if err != nil {
 			jc.logger.Error(
 				"Failed to parse job efficiency",

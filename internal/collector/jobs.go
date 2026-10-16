@@ -13,6 +13,7 @@ import (
 type JobInfo struct {
 	Name      string
 	Partition string
+	Reason    string
 	Time      float64
 	TimeLeft  float64
 	TimeLimit float64
@@ -20,8 +21,7 @@ type JobInfo struct {
 
 // JobsData executes squeue for a specific cluster and job state.
 func JobsData(logger *logger.Logger, cluster string, state string) ([]byte, error) {
-	// Now include %P for partition
-	args := []string{"-a", "-h", "-o", "%i|%P|%j|%M|%L|%l", "--states=" + state}
+	args := []string{"-a", "-r", "-h", "-o", "%i|%P|%j|%M|%L|%l|%r", "--states=" + state}
 
 	if cluster != "" {
 		args = append([]string{"-M", cluster}, args...)
@@ -132,7 +132,7 @@ func ParseJobsMetrics(logger *logger.Logger, cluster string, state string) (map[
 
 		parts := strings.Split(line, "|")
 
-		if len(parts) < 6 {
+		if len(parts) < 7 {
 			logger.Warn(
 				"Skipping malformed job",
 				"cluster", cluster,
@@ -182,6 +182,7 @@ func ParseJobsMetrics(logger *logger.Logger, cluster string, state string) (map[
 		jobs[jobid] = &JobInfo{
 			Partition: strings.TrimSpace(parts[1]),
 			Name:      strings.TrimSpace(parts[2]),
+			Reason:    strings.TrimSpace(parts[6]),
 			Time:      jobTime,
 			TimeLeft:  timeLeft,
 			TimeLimit: timeLimit,
@@ -213,7 +214,7 @@ type JobsCollector struct {
 
 // NewJobsCollector creates a new collector for job metrics.
 func NewJobsCollector(logger *logger.Logger, clusters map[string]string) *JobsCollector {
-	labels := []string{"jobid", "name", "partition", "slurm_cluster"}
+	labels := []string{"jobid", "name", "partition", "reason", "slurm_cluster"}
 
 	return &JobsCollector{
 		clusters: clusters,
@@ -300,7 +301,7 @@ func (jc *JobsCollector) Collect(ch chan<- prometheus.Metric) {
 		runningJobs, err := ParseJobsMetrics(jc.logger, cluster, "RUNNING")
 		if err == nil {
 			for jobid, job := range runningJobs {
-				labels := []string{jobid, job.Name, job.Partition, clusterLabel}
+				labels := []string{jobid, job.Name, job.Partition, job.Reason, clusterLabel}
 
 				ch <- prometheus.MustNewConstMetric(
 					jc.running,
@@ -353,7 +354,7 @@ func (jc *JobsCollector) Collect(ch chan<- prometheus.Metric) {
 		pendingJobs, err := ParseJobsMetrics(jc.logger, cluster, "PENDING")
 		if err == nil {
 			for jobid, job := range pendingJobs {
-				labels := []string{jobid, job.Name, job.Partition, clusterLabel}
+				labels := []string{jobid, job.Name, job.Partition, job.Reason, clusterLabel}
 
 				ch <- prometheus.MustNewConstMetric(
 					jc.pending,
