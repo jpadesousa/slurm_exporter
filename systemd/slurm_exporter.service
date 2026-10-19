@@ -9,7 +9,7 @@ Type=simple
 User=root
 Group=root
 
-ExecStart=/usr/local/bin/slurm_exporter --web.listen-address=":9341" --slurm.cluster=merlin7,gmerlin7 --collector.sacct_efficiency --command.timeout=120s
+ExecStart=/usr/local/bin/slurm_exporter --web.listen-address=":9341" --slurm.cluster=merlin7,gmerlin7 --collector.sacct_efficiency --command.timeout=120s --collector.job_efficiency.refresh-time=3600 --collector.job_efficiency.sacct-time-before-now="6hours"
 
 Restart=on-failure
 RestartSec=5
