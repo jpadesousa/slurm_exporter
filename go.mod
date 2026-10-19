@@ -1,4 +1,4 @@
-module gitea.psi.ch/agosti_j/slurm_exporter
+module github.com/jpadesousa/slurm_exporter
 
 go 1.26.0
 

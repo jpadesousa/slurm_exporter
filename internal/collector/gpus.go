@@ -7,7 +7,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
-	"gitea.psi.ch/agosti_j/slurm_exporter/internal/logger"
+	"github.com/jpadesousa/slurm_exporter/internal/logger"
 )
 
 // GPUsMetrics holds GPU utilization statistics from Slurm

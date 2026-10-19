@@ -16,8 +16,8 @@ import (
 	"github.com/prometheus/exporter-toolkit/web"
 	webflag "github.com/prometheus/exporter-toolkit/web/kingpinflag"
 
-	"gitea.psi.ch/agosti_j/slurm_exporter/internal/collector"
-	"gitea.psi.ch/agosti_j/slurm_exporter/internal/logger"
+	"github.com/jpadesousa/slurm_exporter/internal/collector"
+	"github.com/jpadesousa/slurm_exporter/internal/logger"
 )
 
 var (
@@ -182,7 +182,7 @@ var collectorConstructors = map[string]func(logger *logger.Logger) prometheus.Co
 		return collector.NewJobsCollector(l, clustersMap(*slurmClusters))
 	},
 	"job_efficiency": func(l *logger.Logger) prometheus.Collector {
-		c := collector.NewJobEffCollector(l, clustersMap(*slurmClusters), *jobEffTimeBeforeNow, *jobEffRefreshTime)
+		c := collector.NewJobEffCollector(l, clustersMap(*slurmClusters), *jobEfficiencyLookback, *jobEffRefreshTime)
 		go c.Start()
 		return c
 	},
