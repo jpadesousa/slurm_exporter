@@ -46,7 +46,7 @@ jobs:
           go build \
             -ldflags="-X main.version=${VERSION}" \
             -o "dist/cluster_exporter-${{ matrix.name }}${{ matrix.extension }}" \
-            .
+            ./cmd/slurm_exporter
 
       - name: Upload binary artifact
         uses: actions/upload-artifact@v7
